@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 import time
 from datetime import datetime, timedelta, timezone, tzinfo
 from importlib import resources
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -564,10 +566,7 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
             params["keyword"] = json.dumps(keyword)
 
         def fetch(a: Apis, start: int, count: int) -> tuple[int, list[dict[str, Any]]]:
-            d = data(a.logcenter.request_data("SYNO.Core.SyslogClient.Log", "entry.cgi",
-                                              {"version": 1, "method": "list", "offset": start, "limit": count,
-                                               **params}))
-            return d.get("total") or 0, d.get("items") or []
+            return _syslog(a, start, count, **params)
 
         def run(a: Apis) -> dict[str, Any]:
             clock = _clock(a)
@@ -643,6 +642,154 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
 
         return nas.call(run)
 
+    # ---- Network ------------------------------------------------------------
+
+    @tool(Tier.READ, READ)
+    def network_config() -> dict[str, Any]:
+        """Network setup (static configuration): hostname, default gateway, DNS servers, and each interface's IP/subnet, MAC, link status, negotiated speed/duplex and MTU. Live throughput is in system_utilization."""
+
+        def run(a: Apis) -> dict[str, Any]:
+            net = data(a.sysinfo.network_status())
+            info = data(a.sysinfo.get_network_info())
+            macs = {n.get("id"): n.get("mac") for n in info.get("nif") or []}
+            gw = net.get("gateway_info") or {}
+            ifaces = []
+            for e in data(a.sysinfo.network_ethernet()) or []:
+                up = e.get("status") == "connected"
+                ifaces.append({
+                    "name": e.get("ifname"), "status": e.get("status"), "ip": e.get("ip"), "mask": e.get("mask"),
+                    "mac": macs.get(e.get("ifname")),
+                    "speed_mbps": e.get("speed") if up and (e.get("speed") or 0) > 0 else None,
+                    "duplex": ("full" if e.get("duplex") else "half") if up else None,
+                    "mtu": e.get("mtu"), "addressing": "dhcp" if e.get("use_dhcp") else "static",
+                    "ipv6": ", ".join(str(x.get("address", x)) if isinstance(x, dict) else str(x)
+                                      for x in e.get("ipv6") or []) or None,
+                    "vlan": e.get("vlan_id") if e.get("enable_vlan") else None,
+                })
+            bonds = data(a.sysinfo.network_bond()) or []
+            return _compact({
+                "hostname": net.get("server_name") or info.get("hostname"),
+                "workgroup": info.get("workgroup"),
+                "gateway": net.get("gateway"),
+                "gateway_interface": gw.get("ifname"),
+                "ipv6_gateway": net.get("v6gateway"),
+                "dns": [d for d in (net.get("dns_primary"), net.get("dns_secondary")) if d],
+                "dns_source": "manual" if net.get("dns_manual") else "dhcp",
+                "interfaces": _table(ifaces, ["name", "status", "ip", "mask", "mac", "speed_mbps", "duplex", "mtu",
+                                              "addressing", "ipv6", "vlan"]),
+                "bonds": [_compact(b) for b in bonds] if isinstance(bonds, list) else None,
+            })
+
+        return nas.call(run)
+
+    # ---- Packages -----------------------------------------------------------
+
+    @tool(Tier.READ, READ)
+    def packages() -> dict[str, Any]:
+        """Installed packages with version, running/stopped status and available updates (new version, and whether it is a security release), checked against Package Center's catalogue and any third-party feeds configured there. Packages in neither (system components, manual installs) show update_to "not in catalogue"."""
+
+        def run(a: Apis) -> dict[str, Any]:
+            installed = data(a.packages.list_installed(additional=["status"])).get("packages") or []
+            out: dict[str, Any] = {}
+            try:
+                catalogue = data(a.packages.list_installable())
+                latest = {p.get("id") or p.get("package"): p for p in catalogue.get("packages") or []}
+                # Third-party feeds added in Package Center (e.g. SynoCommunity) are a separate listing:
+                # blloadothers=true returns only those, fetched live (a few seconds). Optional.
+                others = _optional(lambda: _raw(a, "SYNO.Core.Package.Server", "list", blforcereload="false",
+                                                blloadothers="true"))
+                if others is None:
+                    out["third_party_feeds"] = "not checked (feed listing failed)"
+                for p in (others or {}).get("packages") or []:
+                    latest.setdefault(p.get("id") or p.get("package"), p)
+            except SynoBaseException as e:
+                if _must_propagate(e):
+                    raise
+                latest = None
+                out["updates_available"] = (f"unknown: Package Center catalogue unavailable "
+                                            f"(DSM error {getattr(e, 'error_code', '?')})")
+            rows = []
+            for p in sorted(installed, key=lambda p: (p.get("name") or p.get("id") or "").lower()):
+                add = p.get("additional") or {}
+                row = {"name": p.get("name") or p.get("id"), "id": p.get("id"), "version": p.get("version"),
+                       "status": add.get("status")}
+                if latest is not None:
+                    new = latest.get(p.get("id"))
+                    if new is None:
+                        row["update_to"] = "not in catalogue"  # system component or manual install: not checked
+                    elif _version_key(new.get("version")) > _version_key(p.get("version")):
+                        row["update_to"] = new.get("version")
+                        row["security_update"] = bool(new.get("is_security_version"))
+                rows.append(row)
+            out["packages"] = _table(rows, ["name", "id", "version", "status", "update_to", "security_update"])
+            if latest is not None:
+                out["updates_available"] = sum(1 for r in rows if r.get("update_to") not in (None, "not in catalogue"))
+            return out
+
+        return nas.call(run)
+
+    # ---- Hardware & power ---------------------------------------------------
+
+    @tool(Tier.READ, READ)
+    def hardware_power(wake_events: Annotated[int, Field(ge=0, le=100)] = 10) -> dict[str, Any]:
+        """Disk hibernation timers (internal and USB disks), hibernation debug settings, recent disk wake-ups from the system log, fan mode, power-on/off schedule, restart after power loss, Wake-on-LAN and UPS status. DSM does not report whether a disk is currently spun down."""
+
+        def run(a: Apis) -> dict[str, Any]:
+            clock = _clock(a)
+            hib = data(a.sysinfo.hardware_hibernation())
+            support = _optional(lambda: _raw(a, "SYNO.Core.SupportForm.Service", "get")) or {"error": "unknown"}
+            usb = (_optional(lambda: _raw(a, "SYNO.Core.ExternalDevice.Storage.USB", "list",
+                                          additional=json.dumps(["all"]))) or {}).get("devices") or []
+            fan = data(a.sysinfo.hardware_fan_speed())
+            schedule = _optional(lambda: _raw(a, "SYNO.Core.Hardware.PowerSchedule", "load"))
+            recovery = _optional(lambda: _raw(a, "SYNO.Core.Hardware.PowerRecovery", "get"))
+            ups = data(a.sysinfo.hardware_ups())
+
+            wakes: dict[str, Any] | str | None = None
+            if wake_events and not hib.get("enable_log"):
+                wakes = "not logged: the HDD wake-up log is off (Control Panel > Hardware & Power)"
+            elif wake_events:
+                total, items = _syslog(a, 0, wake_events, logtype=json.dumps("system"),
+                                       keyword=json.dumps("woke up from hibernation"))
+                wakes = _table([{"time": clock.local(i.get("time")), "event": i.get("descr")} for i in items],
+                               ["time", "event"], time_col="time", tz=clock.name)
+                wakes["total"] = total
+
+            return _compact({
+                # Settings are stated explicitly (on/off), since the question is usually "is X enabled?".
+                "hibernation": {
+                    "internal_disks_idle": _minutes(hib.get("internal_hd_idletime")),
+                    "usb_disks_idle": _minutes(hib.get("usb_idletime")),
+                    "wake_up_log": _onoff(hib.get("enable_log")),
+                    "auto_poweroff": _onoff(hib.get("auto_poweroff_enable")),
+                    "debug_mode": support.get("error") or (
+                        f"on (level {support.get('hibernation_debug_level')})" if support.get("hibernation_debug_en")
+                        else "off"),
+                },
+                "usb_disks": [_compact({"id": d.get("dev_id"), "name": d.get("dev_title"),
+                                        "product": " ".join(filter(None, (d.get("producer"), d.get("product")))),
+                                        "shares": [p.get("share_name") for p in d.get("partitions") or []
+                                                   if p.get("share_name")],
+                                        "status": d.get("status")}) for d in usb],
+                "recent_wake_ups": wakes,
+                "fan_mode": fan.get("dual_fan_speed") or fan.get("fan_speed"),
+                "power": {
+                    "restart_after_power_failure": _onoff(recovery.get("rc_power_config")) if recovery else "unknown",
+                    "wake_on_lan": (", ".join(f"LAN {w.get('idx')}" for w in recovery.get("wol") or [] if w.get("enable"))
+                                    or "off") if recovery else "unknown",
+                    "power_on_schedule": (schedule.get("poweron_tasks") or "none") if schedule else "unknown",
+                    "power_off_schedule": (schedule.get("poweroff_tasks") or "none") if schedule else "unknown",
+                },
+                "ups": _compact({
+                    "enabled": ups.get("enable"), "connected": ups.get("usb_ups_connect"), "mode": ups.get("mode"),
+                    "model": " ".join(filter(None, (ups.get("manufacture"), ups.get("model")))),
+                    "status": ups.get("status"),
+                }) | {"charge_pct": ups.get("charge"), "runtime_s": ups.get("runtime")}  # 0 matters here
+                if ups.get("enable") or ups.get("usb_ups_connect") else "not configured",
+            })
+
+        return nas.call(run)
+
     # ---- File Station -------------------------------------------------------
 
     @tool(Tier.READ, READ)
@@ -705,6 +852,50 @@ LEVEL_SCAN_MAX = 20000
 NOTIFY_DROP_PARAMS = {"%HOSTNAME%", "%OSNAME%", "%DATE%", "%TIME%", "%PRE_APP_LINK%", "%POST_APP_LINK%"}
 NOTIFY_LEVELS = {"NOTIFICATION_INFO": "info", "NOTIFICATION_WARN": "warn", "NOTIFICATION_ERROR": "err"}
 WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]  # DSM week_day: 0 = Sunday
+
+def _raw(a: Apis, api: str, method: str, **params: Any) -> Any:
+    """Call a DSM API the library has no method for, at its highest advertised version."""
+    info = a.sysinfo.gen_list.get(api)
+    if not info:
+        raise ToolError(f"{api} is not available on this NAS")
+    return data(a.sysinfo.request_data(api, info["path"], {"version": info["maxVersion"], "method": method, **params}))
+
+
+def _syslog(a: Apis, offset: int, limit: int, **params: Any) -> tuple[int, list[dict[str, Any]]]:
+    """One page of SYNO.Core.SyslogClient.Log (string params must be JSON-quoted)."""
+    d = data(a.logcenter.request_data("SYNO.Core.SyslogClient.Log", "entry.cgi",
+                                      {"version": 1, "method": "list", "offset": offset, "limit": limit, **params}))
+    return d.get("total") or 0, d.get("items") or []
+
+
+def _version_key(v: Any) -> tuple[int, ...]:
+    """Package versions like "3.0.5-24122" compared numerically, part by part."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
+
+
+def _onoff(v: Any) -> str | None:
+    """None when DSM didn't report the setting, so it isn't shown as "off"."""
+    return None if v is None else "on" if v else "off"
+
+
+def _optional(fn: Callable[[], Any]) -> Any:
+    """Run a lookup that some NAS models or accounts may not support: None instead of failing the tool."""
+    try:
+        return fn()
+    except ToolError:
+        return None
+    except SynoBaseException as e:
+        if _must_propagate(e):
+            raise
+        return None
+
+
+def _minutes(v: Any) -> str | None:
+    """Hibernation idle time (minutes; 0 = never)."""
+    if v is None:
+        return None
+    return "never" if not v else f"{v} min"
+
 
 def _must_propagate(e: SynoBaseException) -> bool:
     """Connection/HTTP errors (no error_code) and expired sessions must reach Nas.call."""

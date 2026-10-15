@@ -20,6 +20,7 @@ from synology_api.cloud_sync import CloudSync
 from synology_api.core_sys_info import SysInfo
 from synology_api.exceptions import SynoBaseException, SynoConnectionError
 from synology_api.filestation import FileStation
+from synology_api.core_package import Package
 from synology_api.log_center import LogCenter
 from synology_api.task_scheduler import TaskScheduler
 
@@ -64,6 +65,7 @@ class Apis:
         self.filestation = FileStation(*args, interactive_output=False, **kw)
         self.tasks = TaskScheduler(*args, **kw)
         self.logcenter = LogCenter(*args, **kw)
+        self.packages = Package(*args, **kw)
 
 
 class Nas:
