@@ -1,0 +1,23 @@
+[project]
+name = "mcp-synology"
+version = "0.1.0"
+description = "MCP server for Synology DSM: Cloud Sync, File Station and system health, with permission tiers"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "danjam", email = "3920749+danjam@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.3,<3",
+    "synology-api==0.9.4",
+    "tzdata",
+]
+
+[project.scripts]
+mcp-synology = "mcp_synology:main"
+
+[build-system]
+requires = ["uv_build>=0.8.15,<0.9.0"]
+build-backend = "uv_build"

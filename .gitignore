@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+.claude/settings.local.json
+# Local MCP config: contains LAN host/port. README documents the format.
+.mcp.json
