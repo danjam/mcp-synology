@@ -128,9 +128,10 @@ Tools above your chosen level are hidden from the assistant entirely, so it can'
 | **Network** | Hostname, gateway, DNS servers, and each network port's IP address, MAC, link speed and MTU |
 | **Packages** | Installed packages, whether each is running, and available updates from Package Center, including third-party sources you've added such as SynoCommunity (flagging security releases) |
 | **Hardware & power** | Disk hibernation timers, recent disk wake-ups, hibernation debug mode, fan mode, power schedule, restart after power loss, Wake-on-LAN and UPS |
-| **Cloud Sync** | Each connection's status, files still to sync, cloud quota, sync folders, a speed and time-remaining estimate, live transfers, and the full sync log (filter by upload, download or delete, or by file name) |
+| **Cloud Sync** | Each connection's status, files still to sync, cloud quota, sync folders, bandwidth limits and sync schedule, a time-remaining estimate, live transfers with each file's speed, and the full sync log (filter by upload, download or delete, or by file name) |
 | **Task Scheduler** | Every scheduled task with its schedule, next run and last result, and the run history of any task, e.g. "did my nightly task succeed every night this week?" |
-| **Log Center** | System log (hardware, disks, network, updates), connection log (sign-ins and failed logins) and SMB file-access log, filtered by severity, keyword and date range |
+| **Log Center** | System log (hardware, disks, network, updates), connection log (sign-ins and failed logins) and SMB file-access log, filtered by severity, keyword and date range, or summarised (how many, since when, how often, per day or hour) |
+| **Security** | Security Advisor's latest scan and failing checks, and installed certificates with their expiry dates |
 | **Notifications** | DSM's desktop notifications, e.g. security advisories and available updates |
 | **Files** | Shared folders, folder listings and file details, with sizes and dates |
 
@@ -151,6 +152,7 @@ Times are shown in the NAS's own time zone, with the zone named in each answer.
 
 - Task Scheduler shows each run's result (success or exit code) but not its output. DSM 7.3 doesn't expose that through its API.
 - Filtering logs by severity reads up to 20,000 entries per request, so rare entries in a very large log may take several requests to reach.
+- Cloud Sync has no per-connection speed figure: DSM reports each file's speed, which doesn't add up to a reliable total. Network traffic for the whole NAS is under System.
 - DSM doesn't report whether a disk is spun down right now. You can see when disks last woke up, and the hibernation settings.
 - The hibernation debug log itself isn't readable through DSM's API, only whether debug mode is on.
 - Only one NAS per server entry. Add another entry with a different name for a second NAS.

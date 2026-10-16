@@ -380,7 +380,7 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
 
     @tool(Tier.READ, READ)
     def cloudsync_status(estimate_rate: bool = True) -> dict[str, Any]:
-        """Cloud Sync overview (Dropbox, Google Drive, OneDrive, S3, ...): per connection status, files left, cloud quota, sync tasks, throughput and ETA. Start here for "is the sync done / how long left"."""
+        """Cloud Sync overview (Dropbox, Google Drive, OneDrive, S3, ...): per connection status, files left, cloud quota, sync tasks, bandwidth limits, sync schedule, and a files/s rate with ETA. Start here for "is the sync done / how long left". DSM has no per-connection bytes/s figure; per-file rates are in cloudsync_activity, NAS-wide network traffic in system_utilization."""
 
         def run(a: Apis) -> dict[str, Any]:
             d = data(a.cloudsync.get_connections())
@@ -388,6 +388,8 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
             for c in d.get("conn", []):
                 cid = c["id"]
                 q = data(a.cloudsync.get_connection_information(cid))
+                cfg = _optional(lambda: data(a.cloudsync.get_connection_settings(cid))) or {}
+                sessions = data(a.cloudsync.get_tasks(cid)).get("sess", [])
                 tasks = [
                     {
                         "sess_id": s.get("sess_id"),
@@ -397,7 +399,7 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
                         "status": s.get("sync_status"),
                         "error": s.get("error_desc"),
                     }
-                    for s in data(a.cloudsync.get_tasks(cid)).get("sess", [])
+                    for s in sessions
                 ]
                 conns.append(_compact({
                     "conn_id": cid,
@@ -409,6 +411,11 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
                     "quota": (f"{_size(q['quota_used'])} of {_size(q['quota_total'])} "
                               f"({100 * q['quota_used'] / q['quota_total']:.1f}%)") if q.get("quota_total") else None,
                     "tasks": _table(tasks, ["sess_id", "local", "remote", "direction", "status", "error"]),
+                    "limits": (_compact({"upload": _limit_str(cfg.get("max_upload_speed")),
+                                         "download": _limit_str(cfg.get("max_download_speed"))}) or "unknown")
+                    if cfg else "unknown",
+                    "sync_schedule": _sync_schedule(cfg) if cfg else "unknown",
+                    "poll_interval_s": cfg.get("pull_event_period"),
                     "rate": _rate(a, _clock(a), cid, c.get("unfinished_files") or 0) if estimate_rate and c.get(
                         "unfinished_files") else None,
                 }))
@@ -418,7 +425,7 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
 
     @tool(Tier.READ, READ)
     def cloudsync_activity(limit: Annotated[int, Field(ge=1, le=200)] = 10) -> dict[str, Any]:
-        """Cloud Sync live activity: files transferring right now (with progress) and the latest completed changes."""
+        """Cloud Sync live activity: files transferring right now (with progress and each file's own transfer rate) and the latest completed changes. Per-file rates don't add up to a connection's throughput (files start and finish between polls)."""
 
         def run(a: Apis) -> dict[str, Any]:
             d = data(a.cloudsync.get_recently_modified())
@@ -428,9 +435,10 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
             if processing:
                 out["transferring"] = _table(
                     [{"status": i.get("status"), "path": i.get("path"), "sess_id": i.get("session_id"),
-                      "size": _size(i.get("total_size")), "done": _size(i.get("current_size"))}
+                      "size": _size(i.get("total_size")), "done": _size(i.get("current_size")),
+                      "rate": f"{_size(_num(i.get('bit_rate')))}/s" if _num(i.get("bit_rate")) else None}
                      for i in processing[:limit]],
-                    ["status", "sess_id", "path", "size", "done"], path_col="path")
+                    ["status", "sess_id", "path", "size", "done", "rate"], path_col="path")
                 out["transferring"]["total"] = len(processing)
             if history:
                 out["recent"] = _table(
@@ -559,8 +567,12 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
         until: Annotated[str, Field(description="same formats as since; a bare date includes that whole day")] = "",
         limit: Annotated[int, Field(ge=1, le=500)] = 50,
         offset: Annotated[int, Field(ge=0)] = 0,
+        summarize: Annotated[Literal["none", "day", "hour"], Field(
+            description="instead of entries: per-event count, first/last seen and median interval, plus counts per "
+                        "day or hour (periods with none are omitted). Events are distinct message texts, so use "
+                        "keyword to group variants (e.g. different IPs)")] = "none",
     ) -> dict[str, Any]:
-        """DSM Log Center, newest first. system: hardware, disk/RAID, network link, updates, services. connection: sign-ins and failed logins (DSM, SSH, SMB, NFS...). smb: SMB file operations (who, IP, path)."""
+        """DSM Log Center, newest first. system: hardware, disk/RAID, network link, updates, services. connection: sign-ins and failed logins (DSM, SSH, SMB, NFS...). smb: SMB file operations (who, IP, path). For "since when / how many / how often" questions use summarize (cheap) with keyword and since/until."""
         params: dict[str, Any] = {"logtype": json.dumps(LOGTYPES[log])}
         if keyword:
             params["keyword"] = json.dumps(keyword)
@@ -574,6 +586,8 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
             if lo is not None or hi is not None:
                 params["date_from"] = lo or 0
                 params["date_to"] = hi or int(time.time()) + 86400
+            if summarize != "none":
+                return _log_summary(a, clock, fetch, offset, level, log, summarize)
             if level == "any":
                 total, items = fetch(a, offset, limit)
                 next_raw = offset + len(items) if offset + len(items) < total else None
@@ -790,6 +804,62 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
 
         return nas.call(run)
 
+    # ---- Security -----------------------------------------------------------
+
+    @tool(Tier.READ, READ)
+    def security_advisor() -> dict[str, Any]:
+        """Security Advisor: time and overall result of the latest scan, results per category, and every failing check with its details (e.g. out-of-date DSM or packages)."""
+
+        def run(a: Apis) -> dict[str, Any]:
+            clock = _clock(a)
+            st = data(a.sysinfo.get_security_scan_status())
+            rules = (data(a.sysinfo.get_security_scan_rules()).get("items") or {}).values()
+            cats = []
+            for name, c in sorted((st.get("items") or {}).items()):
+                fails = {k: v for k, v in (c.get("fail") or {}).items() if v}
+                cats.append({"category": name, "result": c.get("failSeverity"), "checks": c.get("total"),
+                             "failed": ", ".join(f"{v} {k}" for k, v in fails.items()) or None})
+            failing = [{"category": r.get("category"), "severity": r.get("severity"), "check": r.get("strId"),
+                        "details": "; ".join(f"{k.strip('@').lower()}={v}"
+                                             for k, v in ((r.get("action") or {}).get("actionVar") or {}).items())
+                        or None}
+                       for r in rules if r.get("status") == "fail"]
+            return _compact({
+                "last_scan": clock.fmt(st.get("lastScanTime")), "tz": clock.name,
+                "result": st.get("sysStatus"),
+                "running": (st.get("sysProgress") is not None and _num(st.get("sysProgress")) < 100) or None,
+                "categories": _table(cats, ["category", "result", "checks", "failed"]),
+                "failing": _table(failing, ["category", "severity", "check", "details"]) if failing else None,
+            })
+
+        return nas.call(run)
+
+    @tool(Tier.READ, READ)
+    def certificates() -> dict[str, Any]:
+        """Installed TLS certificates: subject and alternative names, issuer, validity dates, days until expiry, and which services use each one."""
+
+        def run(a: Apis) -> dict[str, Any]:
+            clock = _clock(a)
+            rows = []
+            for c in _raw(a, "SYNO.Core.Certificate.CRT", "list").get("certificates") or []:
+                subj, iss = c.get("subject") or {}, c.get("issuer") or {}
+                expires = _cert_epoch(c.get("valid_till"))
+                rows.append({
+                    "id": c.get("id"), "description": c.get("desc"), "default": c.get("is_default"),
+                    "subject": subj.get("common_name"),
+                    "alt_names": ", ".join(subj.get("sub_alt_name") or []) or None,
+                    "issuer": iss.get("common_name") or iss.get("organization"),
+                    "valid_from": clock.fmt(_cert_epoch(c.get("valid_from"))) or c.get("valid_from"),
+                    "expires": clock.fmt(expires) or c.get("valid_till"),
+                    "days_left": int((expires - time.time()) // 86400) if expires else None,
+                    "broken": c.get("is_broken"),
+                    "services": ", ".join(s.get("display_name") or s.get("service") or "" for s in c.get("services") or []) or None,
+                })
+            return _table(rows, ["id", "description", "default", "subject", "alt_names", "issuer", "valid_from",
+                                 "expires", "days_left", "broken", "services"]) | {"tz": clock.name}
+
+        return nas.call(run)
+
     # ---- File Station -------------------------------------------------------
 
     @tool(Tier.READ, READ)
@@ -848,6 +918,8 @@ def build(settings: Settings, nas: Nas) -> MCPServer:
 LOGTYPES = {"system": "system", "connection": "connection", "smb": "cifs"}
 LEVEL_SCAN_PAGE = 1000
 LEVEL_SCAN_MAX = 20000
+SUMMARY_MAX_EVENTS = 20
+SUMMARY_MAX_BUCKETS = 400
 # Redundant (host, OS, the NAS-local date/time of the time column) or HTML link fragments.
 NOTIFY_DROP_PARAMS = {"%HOSTNAME%", "%OSNAME%", "%DATE%", "%TIME%", "%PRE_APP_LINK%", "%POST_APP_LINK%"}
 NOTIFY_LEVELS = {"NOTIFICATION_INFO": "info", "NOTIFICATION_WARN": "warn", "NOTIFICATION_ERROR": "err"}
@@ -871,6 +943,112 @@ def _syslog(a: Apis, offset: int, limit: int, **params: Any) -> tuple[int, list[
 def _version_key(v: Any) -> tuple[int, ...]:
     """Package versions like "3.0.5-24122" compared numerically, part by part."""
     return tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
+
+
+def _num(v: Any) -> int:
+    try:
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rate_str(bps: int) -> str:
+    return f"{_size(bps)}/s ({bps * 8 / 1e6:.1f} Mbit/s)"
+
+
+def _limit_str(v: Any) -> str | None:
+    """Cloud Sync bandwidth limit: stored in bytes/s (DSM's UI shows it /1024 as KB/s); 0 = unlimited.
+    Rendered in the same decimal units as the transfer rates so the two compare directly."""
+    if v is None:
+        return None
+    return "unlimited" if not v else _rate_str(_num(v))
+
+
+def _sync_schedule(cfg: dict[str, Any]) -> Any:
+    """Cloud Sync schedule: a 168-char bitmap, index 24*day + hour, Sunday first ('1' = sync allowed),
+    as DSM's SYNO.ux.ScheduleTable lays it out. Rendered as allowed hours per day."""
+    bits = cfg.get("schedule_info") or ""
+    if not cfg.get("is_enabled_schedule"):
+        return "always"
+    if len(bits) != 168:
+        return f"unknown format: {bits!r}"
+    if "0" not in bits:
+        return "always"
+    out = {}
+    for d, day in enumerate(WEEKDAYS):
+        hours = [h for h in range(24) if bits[24 * d + h] != "0"]
+        out[day] = _hour_ranges(hours) or "none"
+    return out
+
+
+def _hour_ranges(hours: list[int]) -> str:
+    """[0,1,2,9,10] -> "00-03, 09-11" (end exclusive)."""
+    spans, start = [], None
+    for h in range(25):
+        if h < 24 and h in hours:
+            start = h if start is None else start
+        elif start is not None:
+            spans.append(f"{start:02d}-{h:02d}")
+            start = None
+    return ", ".join(spans)
+
+
+def _cert_epoch(s: Any) -> int | None:
+    """OpenSSL-style date ("Oct  4 14:57:53 2027 GMT") to epoch seconds."""
+    if not isinstance(s, str):
+        return None
+    try:
+        return int(datetime.strptime(" ".join(s.split()), "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return None
+
+
+def _log_summary(a: Apis, clock: NasClock, fetch: Callable[[Apis, int, int], tuple[int, list[dict[str, Any]]]],
+                 offset: int, level: str, log: str, bucket: str) -> dict[str, Any]:
+    """Aggregate matching log entries (newest first, bounded scan) per event and per day/hour."""
+    entries, pos, total = [], offset, 0
+    while pos - offset < LEVEL_SCAN_MAX:
+        total, page = fetch(a, pos, LEVEL_SCAN_PAGE)
+        if not page:
+            total = pos  # nothing more to read; don't hand back an offset that loops
+            break
+        pos += len(page)
+        entries += [e for e in page if level == "any" or e.get("level") == level]
+        if pos >= total:
+            break
+    events: dict[str, list[int]] = {}
+    buckets: dict[str, int] = {}
+    width = 10 if bucket == "day" else 13  # "YYYY-MM-DD" / "YYYY-MM-DD HH"
+    for e in entries:
+        key = (f"{e.get('cmd')} by {e.get('username')}" if log == "smb" else e.get("descr")) or "?"
+        t = clock.local(e.get("time"))
+        if isinstance(t, str) and len(t) >= width:
+            buckets[t[:width]] = buckets.get(t[:width], 0) + 1
+        ts = clock.epoch(e.get("time"))
+        events.setdefault(key, []).append(ts if ts is not None else 0)
+    rows = []
+    for key, ts in sorted(events.items(), key=lambda kv: -len(kv[1]))[:SUMMARY_MAX_EVENTS]:
+        count, ts = len(ts), sorted(t for t in ts if t)  # first/last/median from parseable times only
+        gaps = sorted(b - a for a, b in zip(ts, ts[1:]))
+        rows.append({"event": key, "count": count, "first": clock.fmt(ts[0]) if ts else None,
+                     "last": clock.fmt(ts[-1]) if ts else None,
+                     "median_interval": _duration(gaps[len(gaps) // 2]) if gaps else None})
+    out: dict[str, Any] = {
+        "tz": clock.name,
+        "matched": len(entries),
+        "scanned": pos - offset,
+        "events": _table(rows, ["event", "count", "first", "last", "median_interval"]),
+        bucket: {"columns": [bucket, "count"], "rows": [[k, v] for k, v in sorted(buckets.items())[-SUMMARY_MAX_BUCKETS:]]},
+    }
+    if len(buckets) > SUMMARY_MAX_BUCKETS:
+        out["buckets_note"] = f"showing the newest {SUMMARY_MAX_BUCKETS} of {len(buckets)} {bucket}s; narrow with since/until"
+    if len(events) > SUMMARY_MAX_EVENTS:
+        out["other_events"] = len(events) - SUMMARY_MAX_EVENTS
+    if pos < total:
+        out["note"] = (f"scan stopped after {pos - offset} of {total} entries (oldest not reached); narrow with "
+                       f"since/until, or continue from next_offset as a separate summary")
+        out["next_offset"] = pos
+    return out
 
 
 def _onoff(v: Any) -> str | None:
